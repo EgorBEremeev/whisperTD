@@ -43,7 +43,7 @@ from pyannote.audio import Audio as pyannAudio
 #
 # from IPython.display import Audio
 
-from typing import List, NamedTuple, Optional, Tuple, Union, Dict
+from typing import List, NamedTuple, Optional, Tuple, Union, Dict, Generator
 from datetime import datetime
 import time
 import pickle
@@ -51,7 +51,7 @@ from pathlib import Path
 
 from transformers.feature_extraction_utils import PreTrainedFeatureExtractor, BatchFeature
 from transformers.pipelines.base import no_collate_fn, pad_collate_fn
-from transformers.pipelines.pt_utils import PipelineIterator, PipelineChunkIterator
+from transformers.pipelines.pt_utils import PipelineIterator, PipelineChunkIterator, PipelinePackIterator
 
 from ..models.modeling_ct2_utils import Ct2PreTrainedModel
 from utils.tokenizer import Tokenizer as fwTokenizer
@@ -299,6 +299,8 @@ class ASRoverSegmentationCt2Pipeline(Ct2Pipeline):
                 batch_size = 1
             else:
                 batch_size = self._batch_size
+        else:
+            self._batch_size = batch_size
 
         preprocess_params, forward_params, postprocess_params = self._sanitize_parameters(**kwargs)
 
@@ -349,7 +351,7 @@ class ASRoverSegmentationCt2Pipeline(Ct2Pipeline):
         # else:
         #     return self.run_single(inputs, preprocess_params, forward_params, postprocess_params)
 
-        return next(
+        return list(
                 iter(
                         self.get_iterator(
                                 [inputs], num_workers, batch_size, preprocess_params, forward_params, postprocess_params
@@ -431,8 +433,9 @@ class ASRoverSegmentationCt2Pipeline(Ct2Pipeline):
                                           return_tensors="np"  # нужно в ctranslate2.StorageView
                                           )
         return {"input_features": features["input_features"]}
+        # yield {"input_features": features["input_features"]}
 
-    def _forward(self, model_inputs: Dict[str, StorageView], **forward_parameters: Dict):
+    def _forward(self, model_inputs: Generator[Dict[str, StorageView], None, None], **forward_parameters: Dict):
         """
         Refactor Note: Here whisperx.asr.WhisperModel.generate_segment_batched should be eliminated and pure
         model.generate() call should be used. So the base class get_iterator() method will be used and
@@ -442,10 +445,12 @@ class ASRoverSegmentationCt2Pipeline(Ct2Pipeline):
         :return:
         """
         # model_inputs == {"model_input": model_input}
+        # inputs = next(model_inputs)["input_features"]
         prompt = self.tokenizer.prefix_tokens
+        effective_batch_size = model_inputs["input_features"].shape[0]
         result: List[WhisperGenerationResult] = self.model.generate(
                 model_inputs["input_features"],
-                [prompt] * self._batch_size,
+                [prompt] * effective_batch_size,
                 # beam_size=options.beam_size,
                 # patience=options.patience,
                 # length_penalty=options.length_penalty,
@@ -492,6 +497,8 @@ class ASRoverSegmentationCt2Pipeline(Ct2Pipeline):
         # transformers.models.whisper.tokenization_whisper._decode_asr. Он сейчас перегружен работой со stride, которые
         # в моем подходе с предварительной сегментацией нет, но по всяким действиям вполне похож на мой случай
         # text = decode_batch()
-        text = self.tokenizer.batch_decode(model_outputs["tokens_batch"])
+        texts = self.tokenizer.batch_decode(model_outputs["tokens_batch"])
+            # for t in text:
+            #     texts.append(t)
 
-        return text
+        return texts
