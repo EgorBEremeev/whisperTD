@@ -81,14 +81,16 @@ def test_init_ct2pipeline():
 @pytest.mark.parametrize("batch_size", [1, 2, 3, 4, 5, 7])
 def test_AsrOverSegmentationPipeline(batch_size, audio_data, diarization, pipeline):
     waveform_file_m4a = audio_data[0]
-    results = pipeline(waveform_file_m4a[0].numpy()[:128000],
+    result = []
+    for out in pipeline(waveform_file_m4a[0].numpy()[:128000],
                        segmentation=diarization,
                        min_duration_on=0.250,
                        min_duration_off=2.0,
                        batch_size=batch_size
-                       )
-    assert results is not None
-    assert len(results) > 0
+                       ):
+        result.append(out)
+        print(out)
+    assert len(result) > 0
 
 
 if __name__ == '__main__':

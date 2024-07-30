@@ -280,6 +280,7 @@ class ASRoverSegmentationCt2Pipeline(Ct2Pipeline):
         self.tokenizer = tokenizer
         # self.fw_tokenizer = fwTokenizer(tokenizer, True, 'transcribe', tokenizer.language)
         self.feature_extractor = feature_extractor
+
         super().__init__(self.model,
                          self.tokenizer,
                          self.feature_extractor,
@@ -302,6 +303,10 @@ class ASRoverSegmentationCt2Pipeline(Ct2Pipeline):
         else:
             self._batch_size = batch_size
 
+        # This is addition to HF Pipeline - the context which is available in all steps/processing functions
+        # Like we may pass from preprocessing steps any data to postprocessing step and
+        # at the same time no needs to pass them as argument through all Pipeline
+        self._pipeline_context: Dict = {}
         preprocess_params, forward_params, postprocess_params = self._sanitize_parameters(**kwargs)
 
         # Fuse __init__ params and __call__ params without modifying the __init__ ones.
@@ -309,55 +314,7 @@ class ASRoverSegmentationCt2Pipeline(Ct2Pipeline):
         forward_params = {**self._forward_params, **forward_params}
         postprocess_params = {**self._postprocess_params, **postprocess_params}
 
-        # self.call_count += 1
-        # if self.call_count > 10 and self.framework == "pt" and self.device.type == "cuda":
-        #     logger.warning_once(
-        #         "You seem to be using the pipelines sequentially on GPU. In order to maximize efficiency please use a"
-        #         " dataset",
-        #     )
-
-        # is_dataset = Dataset is not None and isinstance(inputs, Dataset)
-        # is_generator = isinstance(inputs, types.GeneratorType)
-        # is_list = isinstance(inputs, list)
-        #
-        # is_iterable = is_dataset or is_generator or is_list
-        #
-        # # TODO make the get_iterator work also for `tf` (and `flax`).
-        # can_use_iterator = self.framework == "pt" and (is_dataset or is_generator or is_list)
-        #
-        # if is_list:
-        #     if can_use_iterator:
-        #         final_iterator = self.get_iterator(
-        #             inputs, num_workers, batch_size, preprocess_params, forward_params, postprocess_params
-        #         )
-        #         outputs = list(final_iterator)
-        #         return outputs
-        #     else:
-        #         return self.run_multi(inputs, preprocess_params, forward_params, postprocess_params)
-        # elif can_use_iterator:
-        #     return self.get_iterator(
-        #         inputs, num_workers, batch_size, preprocess_params, forward_params, postprocess_params
-        #     )
-        # elif is_iterable:
-        #     return self.iterate(inputs, preprocess_params, forward_params, postprocess_params)
-        # elif self.framework == "pt" and isinstance(self, ChunkPipeline):
-        #     return next(
-        #         iter(
-        #             self.get_iterator(
-        #                 [inputs], num_workers, batch_size, preprocess_params, forward_params, postprocess_params
-        #             )
-        #         )
-        #     )
-        # else:
-        #     return self.run_single(inputs, preprocess_params, forward_params, postprocess_params)
-
-        return list(
-                iter(
-                        self.get_iterator(
-                                [inputs], num_workers, batch_size, preprocess_params, forward_params, postprocess_params
-                        )
-                )
-        )
+        return self.get_iterator([inputs], num_workers, batch_size, preprocess_params, forward_params, postprocess_params)
 
     def get_iterator(
             self, inputs, num_workers: int, batch_size: int, preprocess_params, forward_params, postprocess_params
@@ -368,22 +325,15 @@ class ASRoverSegmentationCt2Pipeline(Ct2Pipeline):
             # logger.info("Disabling tokenizer parallelism, we're using DataLoader multithreading already")
             os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-        # collate_fn = no_collate_fn if batch_size == 1 else pad_collate_fn(self.tokenizer, feature_extractor)
-        def _stack_collate_fn(items) -> Dict[str, torch.Tensor]:
-            # inner = pad_collate_fn(self.tokenizer, self.feature_extractor)
-            stacked = {'inputs': torch.stack([x['segment'] for x in items])}
-            return stacked
-
         def _stack_dicts_collate_fn(items: List[Dict]) -> Dict[str, List]:
             return {"segments": [item["segment"] for item in items]}
-
+        # TODO: проверить, почему где-то теряется последний сегмент, проявляется при разном размере батча
         dataloader = DataLoader(dataset, num_workers=num_workers, batch_size=batch_size,
                                 collate_fn=_stack_dicts_collate_fn)  # Расчитываем получать просто List[np.ndarray]
 
         feature_iterator = PipelineIterator(dataloader, self.preprocess, preprocess_params)
-        model_iterator = PipelineIterator(feature_iterator, self.forward,
-                                          forward_params)
-        final_iterator = PipelineIterator(model_iterator, self.postprocess, postprocess_params)
+        model_iterator = PipelineIterator(feature_iterator, self.forward, forward_params)
+        final_iterator = PipelineIterator(model_iterator, self.postprocess, postprocess_params, loader_batch_size=batch_size)
         return final_iterator
 
     def _sanitize_parameters(self, **kwargs):
@@ -407,16 +357,22 @@ class ASRoverSegmentationCt2Pipeline(Ct2Pipeline):
         Use here standard Hugging Face Whisper Feature Extractor and Tokenizer to preprocess raw audio
         into Mel Spectrogram features.
 
-        Note: Refactor WhisperX self implemented feature extraction
-
         :param audio:
         :param segmentation:
-        :param min_duration_off:
-        :param min_duration_on:
+        :param   min_duration_on : float, optional
+                  Remove speech regions shorter than that many seconds.
+                  Recommended is 0.250 seconds.
+
+        :param   min_duration_off : float, optional
+                  Fill gaps between speech regions shorter than many seconds.
+                  Recommended is 2.0 seconds.
         :return:
         """
 
+        # Filter and Merge segments based on speech duration and pauses between segments.
         segmentation_filtered = filter_segments(segmentation, min_duration_on, min_duration_off)
+        # We need the new segmentation to match it with generated transcriptions on postprocess step
+        self._pipeline_context['segmentation_filtered'] = segmentation_filtered
 
         for segment in segmentation_filtered.itersegments():
             start_sample = int(segment.start * self.feature_extractor.sampling_rate)
@@ -425,32 +381,41 @@ class ASRoverSegmentationCt2Pipeline(Ct2Pipeline):
 
             yield {'segment': audio_segment}
 
-    def preprocess(self, audio_segments: Dict[str, List[np.ndarray]],
-                   **preprocess_parameters: Dict
+    def preprocess(self, audio_segments: Dict[str, List[np.ndarray]], **preprocess_parameters: Dict
                    ) -> Dict[str, np.ndarray]:
+        """
+        Extract features from audio data. The feature_extractor is applied on a batch of segments.
+
+        :param audio_segments: Dict["segments", List[np.ndarray]], where list of segments is stacked by data_loader
+        :param preprocess_parameters:
+        :return: features as Dict["input_features", StorageView] object
+        """
         features = self.feature_extractor(audio_segments["segments"],
                                           sampling_rate=self.feature_extractor.sampling_rate,
-                                          return_tensors="np"  # нужно в ctranslate2.StorageView
+                                          return_tensors="np"  # np is required by ctranslate2.StorageView.from_array()
                                           )
         return {"input_features": features["input_features"]}
-        # yield {"input_features": features["input_features"]}
 
-    def _forward(self, model_inputs: Generator[Dict[str, StorageView], None, None], **forward_parameters: Dict):
+    def _forward(self, model_inputs: Dict[str, StorageView], **forward_parameters: Dict
+                 ) -> Dict[str, List[WhisperGenerationResult]]:
         """
-        Refactor Note: Here whisperx.asr.WhisperModel.generate_segment_batched should be eliminated and pure
-        model.generate() call should be used. So the base class get_iterator() method will be used and
-        call the chain of forward()->_forward() method.
+        Applying pure model.generate() and get text tokens.
 
-        :param model_inputs:
+        Note: ct2translate model's encoding is moved into the forward() method of Ct2Pipeline class, as we
+        encapsulate there all functions concerning handling data on appropriate device.
+        So we call the chain of forward()->_forward() method. See also get_iterator().
+
+        :param model_inputs: Dict["input_features", StorageView]
         :return:
         """
-        # model_inputs == {"model_input": model_input}
-        # inputs = next(model_inputs)["input_features"]
+
         prompt = self.tokenizer.prefix_tokens
+        # Here we catch the last batch, which might be shorter than `batch_size`
         effective_batch_size = model_inputs["input_features"].shape[0]
         result: List[WhisperGenerationResult] = self.model.generate(
                 model_inputs["input_features"],
                 [prompt] * effective_batch_size,
+                # TODO: fill this parameters from Ct2GenerationMixin class
                 # beam_size=options.beam_size,
                 # patience=options.patience,
                 # length_penalty=options.length_penalty,
@@ -459,46 +424,29 @@ class ASRoverSegmentationCt2Pipeline(Ct2Pipeline):
                 # suppress_tokens=options.suppress_tokens,
         )
 
-        # Пока это максимально приближенное к whisperX. Возможно перенести это в postprocess как в HF ASR
-        tokens_batch = [x.sequences_ids[0] for x in result]
-        out = {"tokens_batch": tokens_batch}
+        return {"generation_results_batch": result}
 
-        # Нужно проверить структуру result, где там батчи и какие списки
-        # out = {
-        #         "tokens": result["sequences"],
-        #         "token_ids": result["sequences_ids"]
-        # }
-        # if result.scores:
-        #     out["scores"] = result.scores
-        # if result.no_speech_prob:
-        #     out["no_speach_probe"] = result.no_speech_prob
-        return out
-
-    def postprocess(self, model_outputs, **postprocess_parameters: Dict):
+    def postprocess(self, model_outputs: Dict[str, List[WhisperGenerationResult]], **postprocess_parameters: Dict
+                    ) -> Dict[str, List[Dict]]:
         """
-        Refactoring note: here batch decoding should happen, so here corresponding portion of the code
-        from `whisperx.asr.WhisperModel.generate_segment_batched` will be reused.
+        Here batch decoding happens. We work with token_ids here.
+        Other generation results from WhisperGenerationResult do not processed currently
 
-        :param model_outputs:
-        :return:
+        :param model_outputs as Dict[str, List[WhisperGenerationResult]]
+        :return: batch of transcriptions corresponding to audio segments as List[str]
         """
+        tokens_batch = [x.sequences_ids[0] for x in model_outputs["generation_results_batch"]]
+        texts = self.tokenizer.batch_decode(tokens_batch)
 
-        # В WhisperX он явно хотел, чтобы возвращаемый text был str, но сомнительно как это могло получаться из его
-        # кода, ведь tokenozers.Tokenozer.decode_batch() возвращать должен
-        # :obj:`List[str]`: A list of decoded strings
-        # def decode_batch(tokens: List[List[int]]) -> List[str]:  # str: - сомнительно, отчего так было в WhisperX
-        #     res = []
-        #     for tk in tokens:
-        #         res.append([token for token in tk if token < self.tokenizer.eos_token_id])
-        #     # text_tokens = [token for token in tokens if token < self.eot]
-        #     return self.tokenizer.batch_decode(res)
+        timestamped_segments = []
+        for text in texts:
+            segment, track, label = next(self._pipeline_context["segmentation_filtered"].itertracks(yield_label=True))
+            timestamped_segments.append({'text': text,
+                                         'start': segment.start,
+                                         'end': segment.end,
+                                         'speaker': label
+                                         })
+            del self._pipeline_context["segmentation_filtered"][segment, track]
+        return {'timestamped_segment': timestamped_segments}
 
-        # Вообщем надо также посмотреть не применить ли отрефакторенный
-        # transformers.models.whisper.tokenization_whisper._decode_asr. Он сейчас перегружен работой со stride, которые
-        # в моем подходе с предварительной сегментацией нет, но по всяким действиям вполне похож на мой случай
-        # text = decode_batch()
-        texts = self.tokenizer.batch_decode(model_outputs["tokens_batch"])
-            # for t in text:
-            #     texts.append(t)
 
-        return texts
