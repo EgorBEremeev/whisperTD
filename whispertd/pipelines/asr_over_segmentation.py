@@ -22,39 +22,24 @@
 
 """ASR over Speaker diarization pipeline"""
 import os
-import types
+from typing import List, Optional, Union, Dict
 
 import ctranslate2
+import numpy as np
+import torch
 from ctranslate2 import StorageView
 from ctranslate2.models import WhisperGenerationResult
-import numpy as np
-from torch.utils.data import Dataset, DataLoader
-from transformers import Pipeline, PreTrainedTokenizer, WhisperTokenizer, WhisperFeatureExtractor, WhisperTokenizerFast
-
-import torch
-import gc
-
-from pyannote.core import Segment
 from pyannote.core.annotation import Annotation
-from pyannote.audio import Audio as pyannAudio
-# from pyannote.audio import Pipeline
+from torch.utils.data import DataLoader
+from transformers import Pipeline, PreTrainedTokenizer, WhisperTokenizer, WhisperFeatureExtractor, WhisperTokenizerFast
+from transformers.feature_extraction_utils import PreTrainedFeatureExtractor
+from transformers.pipelines.pt_utils import PipelineIterator, PipelineChunkIterator
 
+
+# from pyannote.audio import Pipeline
 # from pyannote.audio.pipelines.utils.hook import ProgressHook
 #
 # from IPython.display import Audio
-
-from typing import List, NamedTuple, Optional, Tuple, Union, Dict, Generator
-from datetime import datetime
-import time
-import pickle
-from pathlib import Path
-
-from transformers.feature_extraction_utils import PreTrainedFeatureExtractor, BatchFeature
-from transformers.pipelines.base import no_collate_fn, pad_collate_fn
-from transformers.pipelines.pt_utils import PipelineIterator, PipelineChunkIterator, PipelinePackIterator
-
-from ..models.modeling_ct2_utils import Ct2PreTrainedModel
-from utils.tokenizer import Tokenizer as fwTokenizer
 
 
 def filter_segments(ann: Annotation, min_duration_on: float = 0.250, min_duration_off: float = 2.0) -> Annotation:
@@ -306,6 +291,7 @@ class ASRoverSegmentationCt2Pipeline(Ct2Pipeline):
         # This is addition to HF Pipeline - the context which is available in all steps/processing functions
         # Like we may pass from preprocessing steps any data to postprocessing step and
         # at the same time no needs to pass them as argument through all Pipeline
+        # TODO: Сука это не работает в мультитред :-)
         self._pipeline_context: Dict = {}
         preprocess_params, forward_params, postprocess_params = self._sanitize_parameters(**kwargs)
 
@@ -372,7 +358,7 @@ class ASRoverSegmentationCt2Pipeline(Ct2Pipeline):
         # Filter and Merge segments based on speech duration and pauses between segments.
         segmentation_filtered = filter_segments(segmentation, min_duration_on, min_duration_off)
         # We need the new segmentation to match it with generated transcriptions on postprocess step
-        self._pipeline_context['segmentation_filtered'] = segmentation_filtered
+        self._pipeline_context['segmentation_filtered'] = segmentation_filtered.copy()
 
         for segment in segmentation_filtered.itersegments():
             start_sample = int(segment.start * self.feature_extractor.sampling_rate)

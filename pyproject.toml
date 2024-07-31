@@ -1,0 +1,30 @@
+[tool.poetry]
+name = "whispertd"
+version = "0.0.1"
+description = "Transcription and Diarization Pipeline with CTranslate2 Whisper model"
+authors = ["Egor  Eremeev <egor.b.eremeev@gmail.com>"]
+license = "MIT"
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+torch = "~2.3.0"
+ctranslate2 = "~4.3.1"
+pybind11 = "==2.11.1"
+numpy = "^1"
+transformers = "~4.42" # 4.42 in colab
+huggingface-hub = "~0.23" # 0.23 in colab
+tokenizers = "~0.19.1"
+pyannote-audio = "~3.3.1"
+
+
+[tool.poetry.group.test]  # This part can be left out
+
+[tool.poetry.group.test.dependencies]
+pytest = "^8.3.2"
+pytest-mock = "*"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
